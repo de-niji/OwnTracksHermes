@@ -7,6 +7,7 @@ Connects [OwnTracks](https://owntracks.org) to [Hermes Agent](https://github.com
 - "Where was I yesterday afternoon?" / "When did I get to the office today?"
 - "How far is Anna from home?"
 - "How many kilometres did I drive this week?"
+- "Remind me to buy milk when I'm at Edeka." / "Tell me when Anna gets home."
 
 The project has two parts:
 
@@ -16,7 +17,8 @@ The project has two parts:
 2. **`skills/owntracks/SKILL.md`**: a Hermes skill that tells the agent when and how to use
    the tools (always state how old a position is, summarise stays, respect privacy).
 
-All access is **read-only**. The Recorder's delete endpoint (`/api/0/kill`) is never called.
+All access to the Recorder is **read-only**. The Recorder's delete endpoint (`/api/0/kill`) is
+never called. The only thing the server writes is its own reminder list.
 
 ```
 OwnTracks app ──MQTT/HTTP──▶ OwnTracks Recorder ◀──HTTP── owntracks-mcp ◀──MCP (stdio)── Hermes Agent
@@ -31,7 +33,10 @@ OwnTracks app ──MQTT/HTTP──▶ OwnTracks Recorder ◀──HTTP── ow
 | `get_distance(lat?, lon?, user?, device?)` | Straight-line distance from the latest position to a point, or to `OWNTRACKS_HOME` when no coordinates are given. |
 | `list_devices()` | All users and devices. |
 | `reverse_geocode(lat, lon)` | Address from the Recorder's geocache. |
-| `owntracks_status()` | Connection check and active configuration (no secrets). |
+| `owntracks_status()` | Connection check, active configuration (no secrets) and reminder checker health. |
+| `create_location_reminder(text, place, trigger?, user?, …)` | "Remind me of X when I arrive at / leave Y". See [Location reminders](#location-reminders). |
+| `list_location_reminders(include_inactive?)` | Show reminders. |
+| `delete_location_reminder(reminder_id)` | Remove a reminder. |
 
 Time arguments accept `now`, `today`, `yesterday`, relative values like `30m`, `6h`, `2d`,
 `1w`, as well as `2026-09-27` or `2026-09-27T14:30` (local time zone).
@@ -48,13 +53,19 @@ Time arguments accept `now`, `today`, `yesterday`, relative values like `30m`, `
 
 ### 1. Register the MCP server
 
-In `~/.hermes/config.yaml` (full example: [`examples/hermes-config.yaml`](examples/hermes-config.yaml)):
+Install the command once (recommended, and needed for location reminders):
+
+```bash
+uv tool install git+https://github.com/de-niji/OwnTracksHermes
+# update later with: uv tool upgrade owntracks-mcp
+```
+
+Then in `~/.hermes/config.yaml` (full example: [`examples/hermes-config.yaml`](examples/hermes-config.yaml)):
 
 ```yaml
 mcp_servers:
   owntracks:                 # keep this name, the skill expects mcp_owntracks_* tools
-    command: uvx
-    args: ["--from", "git+https://github.com/de-niji/OwnTracksHermes", "owntracks-mcp"]
+    command: owntracks-mcp   # or: uvx --from git+https://github.com/de-niji/OwnTracksHermes owntracks-mcp
     env:
       OWNTRACKS_URL: "http://localhost:8083"
       OWNTRACKS_TIMEZONE: "Europe/Berlin"
@@ -64,13 +75,8 @@ mcp_servers:
     timeout: 60
 ```
 
-If the GitHub repository is private, or you prefer a local install:
-
-```bash
-git clone https://github.com/de-niji/OwnTracksHermes ~/OwnTracksHermes
-cd ~/OwnTracksHermes && uv venv && uv pip install .
-# then in config.yaml:  command: /home/<you>/OwnTracksHermes/.venv/bin/owntracks-mcp
-```
+If Hermes cannot find `owntracks-mcp` on its `PATH`, use the absolute path
+(`which owntracks-mcp`, usually `~/.local/bin/owntracks-mcp`).
 
 Put passwords in `~/.hermes/.env` and reference them in the config as `${OWNTRACKS_PASSWORD}`.
 
@@ -91,10 +97,55 @@ cp -r skills/owntracks ~/.hermes/skills/
 ### 3. Test
 
 ```bash
-hermes mcp test owntracks      # should report 6 tools
+hermes mcp test owntracks      # should report 9 tools
 hermes chat
 > Where am I right now?
 ```
+
+## Location reminders
+
+Ask Hermes things like:
+
+- "Remind me to buy milk when I'm at the Edeka on Hammer Straße."
+- "When I leave work, remind me to take the parcel."
+- "Tell me every time Anna gets home."
+- "Remind me to get cash when I'm at the station, but only today."
+
+The place can be a **region from the OwnTracks app** (most reliable, since the phone reports
+entering and leaving immediately), `home`, or any address, which Hermes turns into coordinates
+first (default radius 150 m).
+
+Reminders are delivered by a Hermes **no-agent cron job**. It runs a small check script every
+minute. That costs no tokens and says nothing unless a reminder fires. Set it up once:
+
+```bash
+owntracks-mcp setup-reminders
+# writes ~/.hermes/scripts/owntracks-reminders.sh and prints the cron command, e.g.:
+hermes cron create "every 1m" --no-agent --script owntracks-reminders.sh \
+  --deliver telegram --name owntracks-reminders
+```
+
+Replace `telegram` with where you want the reminder (`signal:+49…`, `discord:#channel`, …).
+A reminder then arrives like:
+
+```
+📍 Buy milk
+(You arrived at Edeka, 17:42)
+```
+
+Details:
+
+- A reminder fires once unless it was created with `repeat`. `expires` ends it automatically.
+- If you are already at the place when you create an "arrive" reminder, it waits for the
+  next arrival.
+- Delay = how often your phone reports (OwnTracks "significant changes" mode can be minutes)
+  + up to one minute for the check. For places that matter, define a region in the app.
+- If the Recorder is unreachable for 15 minutes, you get one warning, and another message
+  when it is back.
+- Reminders are stored in `~/.hermes/owntracks/reminders.json`. Because cron scripts don't
+  see the MCP server's environment, the server also keeps its Recorder settings in
+  `~/.hermes/owntracks/recorder.json` (file mode 0600) for the checker.
+  Set `OWNTRACKS_DATA_DIR` to use a different folder.
 
 ## Configuration (environment variables)
 
@@ -108,6 +159,7 @@ hermes chat
 | `OWNTRACKS_DEFAULT_DEVICE` | no | Default device of that user |
 | `OWNTRACKS_HOME` | no | `lat,lon` of home, for "how far from home" |
 | `OWNTRACKS_TIMEOUT` | no | HTTP timeout in seconds (default 15) |
+| `OWNTRACKS_DATA_DIR` | no | Where reminders are stored (default `$HERMES_HOME/owntracks`, i.e. `~/.hermes/owntracks`) |
 
 Addresses only appear if the Recorder does reverse geocoding (`OTR_GEOKEY`).
 Named places like "Home" or "Work" come from the **regions** (waypoints) set up in the OwnTracks app.
@@ -119,8 +171,9 @@ read, and even delete, all data. So:
 
 - Keep the Recorder reachable only locally or over a VPN, or put a reverse proxy with basic
   auth in front of it (and use `OWNTRACKS_USERNAME` / `OWNTRACKS_PASSWORD`).
-- This MCP server only exposes read-only tools, marks them with `readOnlyHint`, and never
-  calls the delete endpoint.
+- Towards the Recorder this MCP server is read-only and never calls the delete endpoint.
+  Its read tools are marked `readOnlyHint`; only the reminder tools write (to the local
+  reminder file).
 - Location data is very personal. The skill instructs Hermes to share it only with the
   person asking.
 

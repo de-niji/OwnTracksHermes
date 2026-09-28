@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable
 
 from . import geo
+from . import reminders as rem
 from .client import RecorderClient
 from .config import Settings
 
@@ -23,10 +24,15 @@ class OwnTracksService:
         client: RecorderClient,
         *,
         clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+        store: rem.ReminderStore | None = None,
+        recorder_env: dict[str, str] | None = None,
     ):
         self.settings = settings
         self.client = client
         self.clock = clock
+        self.store = store
+        # OWNTRACKS_* settings handed to the cron checker (see ReminderStore).
+        self.recorder_env = recorder_env or {}
 
     # -- resolution ---------------------------------------------------------
 
@@ -90,6 +96,11 @@ class OwnTracksService:
         out["recorder_version"] = await self.client.version()
         out["users"] = await self.client.list_users()
         out["reachable"] = True
+        if self.store is not None:
+            data = self.store.read()
+            out["reminders_file"] = str(self.store.path)
+            out["active_reminders"] = sum(1 for r in data["reminders"] if r.get("active", True))
+            out.update(rem.checker_health(data, self.clock().timestamp()))
         return out
 
     async def list_devices(self) -> dict[str, Any]:
@@ -241,6 +252,189 @@ class OwnTracksService:
                 "note": "Not in the Recorder's geocache (only places the Recorder has already geocoded are known).",
             }
         return {**base, "found": True, "address": hit.get("addr"), "country_code": hit.get("cc")}
+
+    # -- location reminders ---------------------------------------------------
+
+    def _require_store(self) -> rem.ReminderStore:
+        if self.store is None:
+            raise ValueError("Reminders are not available (no data directory configured).")
+        return self.store
+
+    async def _current_record(self, user: str, device: str | None) -> dict[str, Any] | None:
+        return rem.pick_record(await self.client.last(user, device), device)
+
+    async def create_reminder(
+        self,
+        text: str,
+        place: str,
+        trigger: str = "enter",
+        user: str | None = None,
+        device: str | None = None,
+        lat: float | None = None,
+        lon: float | None = None,
+        radius_m: float = 150,
+        repeat: bool = False,
+        expires: str | None = None,
+    ) -> dict[str, Any]:
+        store = self._require_store()
+        now = self.clock()
+        text = (text or "").strip()
+        if not text:
+            raise ValueError("The reminder needs a text.")
+        trig = rem.TRIGGERS.get((trigger or "").strip().lower())
+        if trig is None:
+            raise ValueError("trigger must be 'arrive' or 'leave'.")
+        if not 25 <= radius_m <= 50_000:
+            raise ValueError("radius_m must be between 25 and 50000.")
+
+        name = (place or "").strip()
+        if (lat is None) != (lon is None):
+            raise ValueError("Give both lat and lon, or neither.")
+        if lat is not None:
+            place_def: dict[str, Any] = {
+                "kind": "circle", "lat": lat, "lon": lon, "radius_m": radius_m, "label": name or None,
+            }
+        elif name.lower() == "home":
+            if self.settings.home is None:
+                raise ValueError("OWNTRACKS_HOME is not configured; give lat/lon for home instead.")
+            place_def = {
+                "kind": "circle", "lat": self.settings.home[0], "lon": self.settings.home[1],
+                "radius_m": radius_m, "label": "home",
+            }
+        elif name:
+            place_def = {"kind": "region", "name": name}
+        else:
+            raise ValueError("Give a place: an OwnTracks region name, 'home', or a label plus lat/lon.")
+
+        u = await self._resolve_user(user)
+        d = await self._resolve_device(u, device) if device else None
+        expires_tst = None
+        if expires:
+            expires_tst = geo.parse_time(
+                expires, tz=self.settings.timezone, now=now, end_of_day=True, future=True
+            ).timestamp()
+            if expires_tst <= now.timestamp():
+                raise ValueError("'expires' is in the past.")
+
+        record = await self._current_record(u, d)
+        inside = rem.is_inside(place_def, record) if record else None
+
+        reminder = {
+            "id": rem.new_id(),
+            "text": text,
+            "user": u,
+            "device": d,
+            "trigger": trig,
+            "place": place_def,
+            "repeat": bool(repeat),
+            "expires_tst": expires_tst,
+            "created_tst": now.timestamp(),
+            "active": True,
+            "inside": inside,
+            "fired_count": 0,
+        }
+        with store.transaction() as data:
+            data["reminders"].append(reminder)
+            health = rem.checker_health(data, now.timestamp())
+        store.save_recorder_config(self.recorder_env)
+
+        out: dict[str, Any] = {"created": rem.describe(reminder, self.settings.timezone)}
+        notes = []
+        if inside and trig == "enter":
+            notes.append("Already there right now; the reminder fires on the next arrival.")
+        if inside is False and trig == "leave":
+            notes.append("Not there right now; the reminder fires after arriving and then leaving.")
+        if place_def["kind"] == "region":
+            notes.append(
+                f"'{name}' must match a region defined in the OwnTracks app (case-insensitive)."
+            )
+        if not health["checker_running"]:
+            notes.append(
+                "Reminders are only delivered while the checker cron job runs. "
+                "Set it up once with: owntracks-mcp setup-reminders"
+            )
+        if notes:
+            out["notes"] = notes
+        return out
+
+    async def list_reminders(self, include_inactive: bool = False) -> dict[str, Any]:
+        store = self._require_store()
+        data = store.read()
+        items = [
+            rem.describe(r, self.settings.timezone)
+            for r in data["reminders"]
+            if include_inactive or r.get("active", True)
+        ]
+        return {"reminders": items, **rem.checker_health(data, self.clock().timestamp())}
+
+    async def delete_reminder(self, reminder_id: str) -> dict[str, Any]:
+        store = self._require_store()
+        with store.transaction() as data:
+            before = len(data["reminders"])
+            data["reminders"] = [r for r in data["reminders"] if r["id"] != reminder_id.strip()]
+            removed = before - len(data["reminders"])
+        if not removed:
+            raise ValueError(f"No reminder with id {reminder_id!r}. Use list_location_reminders.")
+        return {"deleted": reminder_id}
+
+    async def check_reminders(self) -> list[str]:
+        """One checker pass. Returns the messages to deliver (usually none)."""
+        store = self._require_store()
+        now_ts = self.clock().timestamp()
+        messages: list[str] = []
+        with store.transaction() as data:
+            checker = data["checker"]
+            checker["last_run"] = now_ts
+            reminders = data["reminders"]
+
+            # Expire and prune.
+            for r in reminders:
+                if r.get("active", True) and r.get("expires_tst") and now_ts > r["expires_tst"]:
+                    r["active"] = False
+                    r["ended_tst"] = now_ts
+            data["reminders"] = reminders = [
+                r for r in reminders
+                if r.get("active", True) or now_ts - r.get("ended_tst", now_ts) < rem.KEEP_INACTIVE_S
+            ]
+            active = [r for r in reminders if r.get("active", True)]
+            if not active:
+                return messages
+
+            try:
+                by_user = {u: await self.client.last(u) for u in {r["user"] for r in active}}
+            except Exception as exc:  # RecorderError, network trouble
+                checker["failures"] = checker.get("failures", 0) + 1
+                if checker["failures"] >= rem.FAILURE_ALERT_THRESHOLD and not checker.get("alerted"):
+                    checker["alerted"] = True
+                    messages.append(
+                        f"⚠️ OwnTracks reminders: the Recorder has been unreachable for "
+                        f"{checker['failures']} checks in a row ({exc})."
+                    )
+                return messages
+            if checker.get("alerted"):
+                messages.append("✅ OwnTracks reminders: the Recorder is reachable again.")
+            checker["failures"] = 0
+            checker["alerted"] = False
+
+            for r in active:
+                record = rem.pick_record(by_user.get(r["user"], []), r.get("device"))
+                if record is None:
+                    continue
+                current = rem.is_inside(r["place"], record)
+                if rem.fires(r["trigger"], r.get("inside"), current):
+                    messages.append(
+                        rem.format_message(
+                            r, record, tz=self.settings.timezone, default_user=self.settings.default_user
+                        )
+                    )
+                    r["fired_count"] = r.get("fired_count", 0) + 1
+                    r["last_fired_tst"] = now_ts
+                    if not r.get("repeat"):
+                        r["active"] = False
+                        r["ended_tst"] = now_ts
+                if current is not None:
+                    r["inside"] = current
+        return messages
 
 
 def _compact_point(p: dict[str, Any], tz: Any) -> dict[str, Any]:

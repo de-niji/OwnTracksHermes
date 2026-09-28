@@ -26,6 +26,12 @@ def _clean_env(env: Mapping[str, str]) -> dict[str, str]:
     return {k: v for k, v in env.items() if v.strip() and not _UNRESOLVED.match(v.strip())}
 
 
+def recorder_env(env: Mapping[str, str] | None = None) -> dict[str, str]:
+    """The OWNTRACKS_* settings that are actually set."""
+    cleaned = _clean_env(os.environ if env is None else env)
+    return {k: v for k, v in cleaned.items() if k.startswith("OWNTRACKS_")}
+
+
 def _parse_bool_or_path(value: str | None) -> bool | str:
     if value is None or value.strip() == "":
         return True

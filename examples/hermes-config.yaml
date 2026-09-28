@@ -4,12 +4,12 @@
 
 mcp_servers:
   owntracks:                      # keep this name: the skill expects mcp_owntracks_* tools
-    # Variant A: run straight from GitHub with uv (no manual install needed)
-    command: uvx
-    args: ["--from", "git+https://github.com/de-niji/OwnTracksHermes", "owntracks-mcp"]
-    # Variant B: after `pip install .` into a venv, point at the script instead:
-    # command: /home/you/OwnTracksHermes/.venv/bin/owntracks-mcp
-    # args: []
+    # After `uv tool install git+https://github.com/de-niji/OwnTracksHermes`
+    # (use the absolute path from `which owntracks-mcp` if Hermes can't find it):
+    command: owntracks-mcp
+    # Alternative without installing (location reminders need the installed command):
+    # command: uvx
+    # args: ["--from", "git+https://github.com/de-niji/OwnTracksHermes", "owntracks-mcp"]
     env:
       OWNTRACKS_URL: "http://localhost:8083"          # OwnTracks Recorder (without /api/0)
       # Only if a reverse proxy in front of the Recorder asks for basic auth:
@@ -23,6 +23,9 @@ mcp_servers:
     tools:
       resources: false
       prompts: false
+
+# Location reminders: run `owntracks-mcp setup-reminders` once, then create the
+# cron job it prints (hermes cron create "every 1m" --no-agent ...).
 
 # Optional: load the skill straight from a clone of this repository
 # skills:

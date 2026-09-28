@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "owntracks-mcp"
-version = "0.1.0"
+version = "0.2.0"
 description = "MCP server that gives Hermes Agent (and any other MCP client) read-only access to an OwnTracks Recorder"
 readme = "README.md"
 license = "MIT"
