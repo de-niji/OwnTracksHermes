@@ -331,6 +331,8 @@ class OwnTracksService:
             "created_tst": now.timestamp(),
             "active": True,
             "inside": inside,
+            # Positions up to here are accounted for; the checker replays newer ones.
+            "last_tst": geo.num(record.get("tst")) if record else now.timestamp(),
             "fired_count": 0,
         }
         with store.transaction() as data:
@@ -401,7 +403,7 @@ class OwnTracksService:
                 return messages
 
             try:
-                by_user = {u: await self.client.last(u) for u in {r["user"] for r in active}}
+                tracks = await self._new_positions(active, now_ts)
             except Exception as exc:  # RecorderError, network trouble
                 checker["failures"] = checker.get("failures", 0) + 1
                 if checker["failures"] >= rem.FAILURE_ALERT_THRESHOLD and not checker.get("alerted"):
@@ -417,24 +419,66 @@ class OwnTracksService:
             checker["alerted"] = False
 
             for r in active:
-                record = rem.pick_record(by_user.get(r["user"], []), r.get("device"))
-                if record is None:
-                    continue
-                current = rem.is_inside(r["place"], record)
-                if rem.fires(r["trigger"], r.get("inside"), current):
-                    messages.append(
-                        rem.format_message(
-                            r, record, tz=self.settings.timezone, default_user=self.settings.default_user
+                # Replay every position since the last check, so a short stop
+                # between two checks is not missed.
+                for record in tracks.get(r["id"], []):
+                    current = rem.is_inside(r["place"], record)
+                    if rem.fires(r["trigger"], r.get("inside"), current):
+                        messages.append(
+                            rem.format_message(
+                                r, record, tz=self.settings.timezone, default_user=self.settings.default_user
+                            )
                         )
-                    )
-                    r["fired_count"] = r.get("fired_count", 0) + 1
-                    r["last_fired_tst"] = now_ts
-                    if not r.get("repeat"):
-                        r["active"] = False
-                        r["ended_tst"] = now_ts
-                if current is not None:
-                    r["inside"] = current
+                        r["fired_count"] = r.get("fired_count", 0) + 1
+                        r["last_fired_tst"] = now_ts
+                        if not r.get("repeat"):
+                            r["active"] = False
+                            r["ended_tst"] = now_ts
+                    if current is not None:
+                        r["inside"] = current
+                    r["last_tst"] = record["tst"]
+                    if not r.get("active", True):
+                        break
         return messages
+
+    async def _new_positions(self, active: list[dict[str, Any]], now_ts: float) -> dict[str, list[dict[str, Any]]]:
+        """Positions newer than each reminder's ``last_tst``, oldest first, keyed by reminder id."""
+        latest = {u: await self.client.last(u) for u in {r["user"] for r in active}}
+
+        # Which device to follow per reminder: the configured one, or the one the
+        # user reported from most recently (the one they are carrying).
+        plan: dict[str, tuple[str, str, float, dict[str, Any]]] = {}
+        for r in active:
+            last = rem.pick_record(latest.get(r["user"], []), r.get("device"))
+            if last is None:
+                continue
+            device = r.get("device") or geo.user_device_from(last)[1]
+            since = max(r.get("last_tst") or last["tst"] - 1, now_ts - rem.MAX_REPLAY_S)
+            if device and geo.num(last["tst"]) > since:
+                plan[r["id"]] = (r["user"], device, since, last)
+
+        # One /locations call per user+device, from the oldest point anyone needs.
+        start: dict[tuple[str, str], float] = {}
+        for user, device, since, _ in plan.values():
+            start[(user, device)] = min(since, start.get((user, device), since))
+        fetched: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        for (user, device), since in start.items():
+            raw = await self.client.locations(
+                user, device,
+                start=geo.to_recorder_time(datetime.fromtimestamp(since + 1, timezone.utc)),
+                end=geo.to_recorder_time(datetime.fromtimestamp(now_ts + 60, timezone.utc)),
+            )
+            fetched[(user, device)] = geo.clean_track(raw)
+
+        out: dict[str, list[dict[str, Any]]] = {}
+        for rid, (user, device, since, last) in plan.items():
+            points = [p for p in fetched.get((user, device), []) if p["tst"] > since]
+            # /last carries the freshest fix (and its regions) even if /locations lags.
+            last_tst = geo.num(last["tst"])
+            if not points or points[-1]["tst"] < last_tst:
+                points.append({**last, "tst": last_tst})
+            out[rid] = points
+        return out
 
 
 def _compact_point(p: dict[str, Any], tz: Any) -> dict[str, Any]:

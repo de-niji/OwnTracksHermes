@@ -229,3 +229,58 @@ def test_check_without_reminders_is_silent(tmp_path, capsys):
 
     assert run_check(tmp_path / "nothing") == 0
     assert capsys.readouterr().out == ""
+
+
+def drive(fake, user, device, points):
+    """Phone reports several positions (tst, lat, lon[, regions]) between two checks."""
+    track = fake.tracks.setdefault((user, device), [])
+    for tst, lat, lon, *regions in points:
+        rec = _rec(int(tst), lat, lon, user, device, **({"inregions": regions} if regions else {}))
+        track.append(rec)
+    fake.last[(user, device)] = track[-1]
+
+
+async def test_short_stop_between_two_checks_is_not_missed(env):
+    fake, clock, svc = env
+    await svc.create_reminder("Buy milk", "Edeka", lat=EDEKA[0], lon=EDEKA[1])
+    await svc.create_reminder("Left work", "Work", trigger="leave")
+    t = clock().timestamp()
+    # Within one minute: leave the office, pass Edeka, drive on home.
+    drive(fake, "nico", "pixel", [
+        (t + 10, 51.9520, 7.5900),
+        (t + 20, *EDEKA),
+        (t + 30, *EDEKA),
+        (t + 50, *HOME),
+    ])
+    clock.tick()
+    fake.requests.clear()
+    msgs = await svc.check_reminders()
+    assert sorted(msgs) == [
+        "📍 Buy milk\n(You arrived at Edeka, 14:00)",
+        "📍 Left work\n(You left Work, 14:00)",
+    ]
+    assert [v for v, _ in fake.requests].count("locations") == 1  # one call per device
+    assert await svc.check_reminders() == []
+
+
+async def test_repeat_catches_every_arrival_between_checks(env):
+    fake, clock, svc = env
+    await svc.create_reminder("Anna home", "home", user="anna", repeat=True)
+    t = clock().timestamp()
+    drive(fake, "anna", "iphone", [(t + 10, *HOME), (t + 20, *EDEKA), (t + 30, *HOME)])
+    clock.tick()
+    msgs = await svc.check_reminders()
+    assert len(msgs) == 2  # two separate arrivals
+    [r] = (await svc.list_reminders())["reminders"]
+    assert r["currently_inside"] is True and r["fired_count"] == 2
+
+
+async def test_reminder_file_without_last_tst_still_works(env):
+    fake, clock, svc = env
+    await svc.create_reminder("Buy milk", "Edeka", lat=EDEKA[0], lon=EDEKA[1])
+    with svc.store.transaction() as data:  # file written by version 0.2.0
+        del data["reminders"][0]["last_tst"]
+    clock.tick()
+    move(fake, clock, "nico", "pixel", *EDEKA)
+    [msg] = await svc.check_reminders()
+    assert msg.startswith("📍 Buy milk")

@@ -140,6 +140,8 @@ Details:
   next arrival.
 - Delay = how often your phone reports (OwnTracks "significant changes" mode can be minutes)
   + up to one minute for the check. For places that matter, define a region in the app.
+- Each check replays every position reported since the previous one, so a short stop
+  between two checks still counts, and the message shows the actual arrival time.
 - If the Recorder is unreachable for 15 minutes, you get one warning, and another message
   when it is back.
 - Reminders are stored in `~/.hermes/owntracks/reminders.json`. Because cron scripts don't

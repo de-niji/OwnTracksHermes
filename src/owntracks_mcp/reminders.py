@@ -29,6 +29,8 @@ TRIGGERS = {"enter": "enter", "arrive": "enter", "arrival": "enter", "leave": "l
 
 # After this many failed checks in a row (~minutes) the checker alerts once.
 FAILURE_ALERT_THRESHOLD = 15
+# After a long pause (checker off, phone offline) only replay this much history.
+MAX_REPLAY_S = 6 * 3600
 # Checker is considered not running when it has not run for this long.
 CHECKER_STALE_S = 5 * 60
 # Fired / expired reminders are kept this long for list_location_reminders.
