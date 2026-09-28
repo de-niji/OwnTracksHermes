@@ -46,14 +46,22 @@ _UNIT_SECONDS = {"m": 60, "min": 60, "h": 3600, "d": 86400, "w": 604800}
 _DATE_ONLY = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
-def parse_time(value: str | None, *, tz: tzinfo | None, now: datetime, end_of_day: bool = False) -> datetime:
+def parse_time(
+    value: str | None,
+    *,
+    tz: tzinfo | None,
+    now: datetime,
+    end_of_day: bool = False,
+    future: bool = False,
+) -> datetime:
     """Parse a user/LLM supplied time into an aware datetime.
 
     Accepts ``now``, ``today``, ``yesterday``, relative offsets like ``30m``,
     ``6h``, ``2d``, ``1w`` (meaning "that long ago"), plain dates
     (``2026-09-27``) and ISO 8601 timestamps. Naive values are interpreted in
     ``tz`` (or the system time zone). ``end_of_day`` makes date-only values
-    resolve to the end of that day instead of its start.
+    resolve to the end of that day instead of its start. ``future`` makes
+    relative offsets count forward from now ("3d" = in three days).
     """
     zone = local_tz(tz)
     if value is None or not value.strip() or value.strip().lower() == "now":
@@ -61,16 +69,19 @@ def parse_time(value: str | None, *, tz: tzinfo | None, now: datetime, end_of_da
     v = value.strip()
     lower = v.lower()
 
-    if lower in ("today", "yesterday"):
+    if lower in ("today", "yesterday", "tomorrow"):
         day = now.astimezone(zone).date()
         if lower == "yesterday":
             day -= timedelta(days=1)
+        elif lower == "tomorrow":
+            day += timedelta(days=1)
         return _day_bound(day, zone, end_of_day)
 
     m = _RELATIVE.match(v)
     if m:
         amount, unit = float(m.group(1)), m.group(2).lower()
-        return now - timedelta(seconds=amount * _UNIT_SECONDS[unit])
+        delta = timedelta(seconds=amount * _UNIT_SECONDS[unit])
+        return now + delta if future else now - delta
 
     if _DATE_ONLY.match(v):
         day = datetime.strptime(v, "%Y-%m-%d").date()

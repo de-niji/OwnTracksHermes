@@ -10,21 +10,39 @@ from mcp.client.stdio import StdioServerParameters, stdio_client
 
 from fake_recorder import FakeRecorder, serve_http
 
-EXPECTED_TOOLS = {
+READ_TOOLS = {
     "owntracks_status",
     "list_devices",
     "get_last_location",
     "get_location_history",
     "get_distance",
     "reverse_geocode",
+    "list_location_reminders",
 }
+WRITE_TOOLS = {"create_location_reminder", "delete_location_reminder"}
 
 
 @pytest.fixture
-def recorder():
-    server, url = serve_http(FakeRecorder(), username="hermes", password="s3cret")
+def fake():
+    return FakeRecorder()
+
+
+@pytest.fixture
+def recorder(fake):
+    server, url = serve_http(fake, username="hermes", password="s3cret")
     yield url
     server.shutdown()
+
+
+@pytest.fixture(autouse=True)
+def data_dir(tmp_path, monkeypatch):
+    monkeypatch.setenv("OWNTRACKS_DATA_DIR", str(tmp_path / "owntracks"))
+    return tmp_path / "owntracks"
+
+
+def _read_only(tool) -> bool:
+    a = tool.annotations
+    return bool(a and (getattr(a, "read_only_hint", None) or getattr(a, "readOnlyHint", None)))
 
 
 def _params(url: str, password: str = "s3cret") -> StdioServerParameters:
@@ -57,11 +75,9 @@ async def test_tools_over_stdio(recorder):
             await session.initialize()
 
             tools = (await session.list_tools()).tools
-            assert {t.name for t in tools} == EXPECTED_TOOLS
+            assert {t.name for t in tools} == READ_TOOLS | WRITE_TOOLS
             for t in tools:
-                assert t.annotations and (
-                    getattr(t.annotations, "read_only_hint", None) or getattr(t.annotations, "readOnlyHint", None)
-                ), t.name
+                assert _read_only(t) == (t.name in READ_TOOLS), t.name
 
             status = _payload(await session.call_tool("owntracks_status", {}))
             assert status["reachable"] and status["auth"] == "basic"
@@ -92,3 +108,39 @@ async def test_wrong_password_is_reported_as_tool_error(recorder):
             res = await session.call_tool("list_devices", {})
             assert _is_error(res)
             assert "OWNTRACKS_USERNAME" in res.content[0].text
+
+
+async def test_reminder_roundtrip_with_cron_checker(recorder, fake, data_dir):
+    """Create a reminder over MCP, then run the checker the way the Hermes cron job does."""
+    import subprocess
+
+    from fake_recorder import HOME, _rec
+
+    async with stdio_client(_params(recorder)) as (read, write):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            created = _payload(
+                await session.call_tool(
+                    "create_location_reminder", {"text": "Water the plants", "place": "home"}
+                )
+            )
+            assert created["created"]["currently_inside"] is False  # nico is at the office
+            assert any("setup-reminders" in n for n in created["notes"])
+
+    # The cron script runs with a sanitized environment: no OWNTRACKS_URL or password.
+    env = {k: v for k, v in os.environ.items() if not k.startswith("OWNTRACKS_")}
+    env["OWNTRACKS_DATA_DIR"] = str(data_dir)
+
+    def check() -> str:
+        out = subprocess.run(
+            [sys.executable, "-m", "owntracks_mcp.server", "check-reminders"],
+            env=env, capture_output=True, text=True, timeout=30,
+        )
+        assert out.returncode == 0, out.stderr
+        return out.stdout.strip()
+
+    assert check() == ""  # still at the office: silent tick
+    fake.last[("nico", "pixel")] = _rec(int(__import__("time").time()), *HOME, "nico", "pixel")
+    msg = check()
+    assert msg.startswith("📍 Water the plants") and "You arrived at home" in msg
+    assert check() == ""  # one-shot: fires only once

@@ -1,7 +1,9 @@
-"""MCP server exposing OwnTracks Recorder data as read-only tools.
+"""MCP server exposing OwnTracks Recorder data, plus location reminders.
 
 Run ``owntracks-mcp`` (stdio, the default for Hermes Agent) or
 ``owntracks-mcp --transport streamable-http --port 8765`` to serve over HTTP.
+``owntracks-mcp check-reminders`` runs one reminder check (for a Hermes cron job)
+and ``owntracks-mcp setup-reminders`` installs that cron script.
 """
 
 from __future__ import annotations
@@ -9,6 +11,8 @@ from __future__ import annotations
 import argparse
 import functools
 import logging
+import sys
+from pathlib import Path
 from typing import Annotated, Any, Awaitable, Callable, TypeVar
 
 from pydantic import Field
@@ -27,8 +31,9 @@ except ImportError:  # MCP Python SDK 1.x
 from mcp.types import ToolAnnotations
 
 from . import __version__
+from . import reminders as rem
 from .client import RecorderClient, RecorderError
-from .config import ConfigError, Settings
+from .config import ConfigError, Settings, recorder_env
 from .service import OwnTracksService
 
 INSTRUCTIONS = """\
@@ -36,11 +41,16 @@ Access to OwnTracks location data stored in an OwnTracks Recorder.
 Use get_last_location for "where is X / where am I", get_location_history for
 "where was X yesterday / what route", get_distance for "how far is X from home /
 from a place", list_devices to discover user and device names.
-The user "me" means the configured default user. All tools are read-only.
-Location data is personal: only share it with the person asking.
+create_location_reminder sets up "remind me of X when I arrive at / leave Y"
+reminders, delivered by a cron checker; list/delete manage them.
+The user "me" means the configured default user. Only the reminder tools write;
+everything else is read-only. Location data is personal: only share it with the
+person asking.
 """
 
 READ_ONLY = ToolAnnotations(readOnlyHint=True, idempotentHint=True, openWorldHint=False)
+WRITES = ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=False)
+DELETES = ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=True, openWorldHint=False)
 
 mcp = _Server("owntracks", instructions=INSTRUCTIONS)
 
@@ -52,7 +62,11 @@ def get_service() -> OwnTracksService:
     global _service
     if _service is None:
         settings = Settings.from_env()
-        _service = OwnTracksService(settings, RecorderClient(settings))
+        store = rem.ReminderStore(rem.data_dir())
+        env = recorder_env()
+        if store.path.exists():  # keep the checker's copy of the settings current
+            store.save_recorder_config(env)
+        _service = OwnTracksService(settings, RecorderClient(settings), store=store, recorder_env=env)
     return _service
 
 
@@ -165,14 +179,88 @@ async def reverse_geocode(
     return await get_service().reverse_geocode(lat, lon)
 
 
+@mcp.tool(annotations=WRITES)
+@explain_errors
+async def create_location_reminder(
+    text: Annotated[str, Field(description="What to remind about, in the user's words, e.g. 'Buy milk'.")],
+    place: Annotated[
+        str,
+        Field(
+            description="Where: the name of a region defined in the OwnTracks app (e.g. 'Work'), "
+            "'home' (uses OWNTRACKS_HOME), or a short label when lat/lon are given (e.g. 'Edeka Hammer Str.')."
+        ),
+    ],
+    trigger: Annotated[str, Field(description="'arrive' or 'leave'.")] = "arrive",
+    user: UserArg = "me",
+    device: DeviceArg = None,
+    lat: Annotated[float | None, Field(ge=-90, le=90, description="Latitude of the place (if not a region).")] = None,
+    lon: Annotated[float | None, Field(ge=-180, le=180, description="Longitude of the place (if not a region).")] = None,
+    radius_m: Annotated[float, Field(ge=25, le=50000, description="Radius around lat/lon or home.")] = 150,
+    repeat: Annotated[bool, Field(description="Fire every time instead of only once.")] = False,
+    expires: Annotated[
+        str | None,
+        Field(description="Optional end, e.g. 'today', '2026-10-01' or '3d'. Relative values count from now."),
+    ] = None,
+) -> dict[str, Any]:
+    """Remind the user when someone arrives at or leaves a place ("remind me to buy milk when I'm at Edeka").
+
+    For shops/addresses, look up the coordinates first and pass lat/lon plus a label.
+    Reminders about other people only work for users in the same OwnTracks Recorder.
+    """
+    return await get_service().create_reminder(
+        text, place, trigger, user, device, lat, lon, radius_m, repeat, expires
+    )
+
+
+@mcp.tool(annotations=READ_ONLY)
+@explain_errors
+async def list_location_reminders(
+    include_inactive: Annotated[bool, Field(description="Also show fired and expired reminders.")] = False,
+) -> dict[str, Any]:
+    """List location reminders and whether the reminder checker is running."""
+    return await get_service().list_reminders(include_inactive)
+
+
+@mcp.tool(annotations=DELETES)
+@explain_errors
+async def delete_location_reminder(
+    reminder_id: Annotated[str, Field(description="The id from list_location_reminders.")],
+) -> dict[str, Any]:
+    """Delete a location reminder."""
+    return await get_service().delete_reminder(reminder_id)
+
+
 def main(argv: list[str] | None = None) -> None:
-    parser = argparse.ArgumentParser(prog="owntracks-mcp", description=__doc__)
-    parser.add_argument("--transport", choices=["stdio", "streamable-http", "sse"], default="stdio")
-    parser.add_argument("--host", default="127.0.0.1", help="Bind address for HTTP transports")
-    parser.add_argument("--port", type=int, default=8765, help="Port for HTTP transports")
-    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
-    args = parser.parse_args(argv)
+    argv = sys.argv[1:] if argv is None else argv
     logging.getLogger("httpx").setLevel(logging.WARNING)  # don't log every request URL
+
+    parser = argparse.ArgumentParser(prog="owntracks-mcp", description=__doc__)
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    sub = parser.add_subparsers(dest="command")
+
+    serve = sub.add_parser("serve", help="Run the MCP server (default)")
+    for p in (parser, serve):
+        p.add_argument("--transport", choices=["stdio", "streamable-http", "sse"], default="stdio")
+        p.add_argument("--host", default="127.0.0.1", help="Bind address for HTTP transports")
+        p.add_argument("--port", type=int, default=8765, help="Port for HTTP transports")
+
+    sub.add_parser("check-reminders", help="Run one location-reminder check (for a Hermes cron job)")
+
+    setup = sub.add_parser("setup-reminders", help="Install the reminder cron script into Hermes")
+    setup.add_argument("--hermes-home", type=Path, help="Hermes home (default: $HERMES_HOME or ~/.hermes)")
+    setup.add_argument("--data-dir", type=Path, help="Where reminders are stored (default: <hermes home>/owntracks)")
+    setup.add_argument("--deliver", default="telegram", help="Delivery target shown in the cron command")
+
+    args = parser.parse_args(argv)
+
+    if args.command == "check-reminders":
+        from .checker import run_check
+
+        sys.exit(run_check())
+    if args.command == "setup-reminders":
+        from .checker import setup_reminders
+
+        sys.exit(setup_reminders(args.hermes_home, args.data_dir, args.deliver))
 
     if args.transport == "stdio":
         mcp.run("stdio")
