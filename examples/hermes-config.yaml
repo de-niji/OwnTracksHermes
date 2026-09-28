@@ -1,0 +1,30 @@
+# Snippet for ~/.hermes/config.yaml
+# Secrets go into ~/.hermes/.env, e.g.:
+#   OWNTRACKS_PASSWORD=...
+
+mcp_servers:
+  owntracks:                      # keep this name: the skill expects mcp_owntracks_* tools
+    # Variant A: run straight from GitHub with uv (no manual install needed)
+    command: uvx
+    args: ["--from", "git+https://github.com/de-niji/OwnTracksHermes", "owntracks-mcp"]
+    # Variant B: after `pip install .` into a venv, point at the script instead:
+    # command: /home/you/OwnTracksHermes/.venv/bin/owntracks-mcp
+    # args: []
+    env:
+      OWNTRACKS_URL: "http://localhost:8083"          # OwnTracks Recorder (without /api/0)
+      # Only if a reverse proxy in front of the Recorder asks for basic auth:
+      OWNTRACKS_USERNAME: "${OWNTRACKS_USERNAME}"
+      OWNTRACKS_PASSWORD: "${OWNTRACKS_PASSWORD}"
+      OWNTRACKS_TIMEZONE: "Europe/Berlin"
+      OWNTRACKS_DEFAULT_USER: "alice"                 # who "me" is
+      OWNTRACKS_DEFAULT_DEVICE: "phone"
+      OWNTRACKS_HOME: "51.9607,7.6261"                # lat,lon for "how far from home"
+    timeout: 60
+    tools:
+      resources: false
+      prompts: false
+
+# Optional: load the skill straight from a clone of this repository
+# skills:
+#   external_dirs:
+#     - /home/you/OwnTracksHermes/skills
